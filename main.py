@@ -103,9 +103,17 @@ class YouTubeDownloaderApp(ctk.CTk):
 
     # --- URL Tracing & Metadata Fetching ---
     def on_url_change(self, *args):
+        # Reset progress UI on new URL
+        self.progress_bar.set(0)
+        self.progress_label.configure(text="0%")
+
         url = self.url_var.get().strip()
-        # Basic validation for youtube URL
-        if "youtube.com" in url or "youtu.be" in url:
+
+        # Enhanced validation for Youtube URLs (handles shorts, full links, share links, and trims parameters when necessary for clean display, though yt-dlp handles parameters fine)
+        yt_regex = r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/(watch\?v=|shorts/|embed/|v/)?([a-zA-Z0-9_-]{11})'
+        match = re.search(yt_regex, url)
+
+        if match:
             self.update_status("Fetching available qualities...")
             self.quality_menu.configure(state="disabled")
             self.download_btn.configure(state="disabled")
@@ -140,26 +148,61 @@ class YouTubeDownloaderApp(ctk.CTk):
 
         formats = self.current_info_dict.get('formats', [])
 
-        self.video_qualities = set()
-        self.audio_qualities = set()
+        # Maps to store best approximate size (in MB) for each resolution/bitrate
+        self.video_sizes = {}
+        self.audio_sizes = {}
+
+        # First gather standard audio size to add to video size if video is video-only format
+        best_audio_size_mb = 0
+        for f in formats:
+             if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                fs = f.get('filesize') or f.get('filesize_approx') or 0
+                mb = fs / (1024 * 1024)
+                if mb > best_audio_size_mb:
+                    best_audio_size_mb = mb
 
         for f in formats:
-            # Video formats (has video, usually best handled by combining later if has audio, but we just want the options)
+            fs = f.get('filesize') or f.get('filesize_approx') or 0
+            size_mb = fs / (1024 * 1024)
+
+            # Video formats
             if f.get('vcodec') != 'none' and f.get('resolution') and f.get('resolution') != 'audio only':
                 res = f.get('resolution')
                 if 'x' in res:
                     res = res.split('x')[1] + 'p'
-                self.video_qualities.add(res)
+
+                # If format has no audio, yt-dlp will merge it with best audio, so we add that expected size
+                if f.get('acodec') == 'none':
+                    size_mb += best_audio_size_mb
+
+                # We might have multiple formats of the same resolution (like different codecs). Keep the max size as an upper bound estimate.
+                if res not in self.video_sizes or size_mb > self.video_sizes[res]:
+                    self.video_sizes[res] = size_mb
 
             # Audio formats
             if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
                 abr = f.get('abr')
                 if abr:
-                    self.audio_qualities.add(f"{int(abr)}kbps")
+                    kbps_str = f"{int(abr)}kbps"
+                    if kbps_str not in self.audio_sizes or size_mb > self.audio_sizes[kbps_str]:
+                        self.audio_sizes[kbps_str] = size_mb
 
-        # Sort and update UI
-        self.video_qualities = sorted(list(self.video_qualities), key=lambda x: int(re.sub(r'[^0-9]', '', x)) if re.sub(r'[^0-9]', '', x).isdigit() else 0, reverse=True)
-        self.audio_qualities = sorted(list(self.audio_qualities), key=lambda x: int(re.sub(r'[^0-9]', '', x)) if re.sub(r'[^0-9]', '', x).isdigit() else 0, reverse=True)
+        # Create sorted lists of formatted strings with sizes
+
+        # Helper to extract integer from res/bitrate for sorting
+        def sort_key(k):
+            digits = re.sub(r'[^0-9]', '', k)
+            return int(digits) if digits.isdigit() else 0
+
+        self.video_qualities = []
+        for res in sorted(self.video_sizes.keys(), key=sort_key, reverse=True):
+            size_str = f" (~{self.video_sizes[res]:.1f} MB)" if self.video_sizes[res] > 0 else ""
+            self.video_qualities.append(f"{res}{size_str}")
+
+        self.audio_qualities = []
+        for kbps in sorted(self.audio_sizes.keys(), key=sort_key, reverse=True):
+            size_str = f" (~{self.audio_sizes[kbps]:.1f} MB)" if self.audio_sizes[kbps] > 0 else ""
+            self.audio_qualities.append(f"{kbps}{size_str}")
 
         self.after(0, self.update_quality_dropdown)
 
@@ -232,25 +275,36 @@ class YouTubeDownloaderApp(ctk.CTk):
             'ffmpeg_location': self.ffmpeg_path if self.ffmpeg_path else None
         }
 
+        # Parse the raw quality string by splitting off the size info if it exists
+        # e.g. "1080p (~45.1 MB)" -> "1080p"
+        raw_quality = quality.split(" (")[0] if " (" in quality else quality
+
         if fmt == "Video":
-            if quality == "best" or quality == "Default Best":
+            if raw_quality == "best" or raw_quality == "Default Best":
                 ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
             else:
-                # E.g. quality is "1080p", extract 1080
-                height = re.sub(r'[^0-9]', '', quality)
+                # E.g. raw_quality is "1080p", extract 1080
+                height = re.sub(r'[^0-9]', '', raw_quality)
                 if height.isdigit():
                     ydl_opts['format'] = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
                 else:
                     ydl_opts['format'] = 'bestvideo+bestaudio/best'
         else:
             ydl_opts['format'] = 'bestaudio/best'
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }]
-            if quality != "bestaudio" and quality != "Default Best":
-                bitrate = re.sub(r'[^0-9]', '', quality)
+            ydl_opts['writethumbnail'] = True
+            ydl_opts['postprocessors'] = [
+                {
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                },
+                {
+                    'key': 'EmbedThumbnail',
+                    'already_have_thumbnail': False,
+                }
+            ]
+            if raw_quality != "bestaudio" and raw_quality != "Default Best":
+                bitrate = re.sub(r'[^0-9]', '', raw_quality)
                 if bitrate.isdigit():
                     ydl_opts['postprocessors'][0]['preferredquality'] = bitrate
 
