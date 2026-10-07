@@ -4,3 +4,4 @@ imageio-ffmpeg
 mutagen
 pillow
 requests
+streamlit
