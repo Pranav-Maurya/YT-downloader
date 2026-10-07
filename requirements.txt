@@ -2,3 +2,5 @@ customtkinter
 yt-dlp
 imageio-ffmpeg
 mutagen
+pillow
+requests
